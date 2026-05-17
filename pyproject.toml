@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "blip25-mbe"
+version = "0.1.0"
+description = "Python bindings for blip25-mbe — P25 MBE/IMBE/AMBE+2 vocoder family"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Chance Lindsey" }]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Communications :: Ham Radio",
+]
+dependencies = ["numpy>=1.22"]
+
+[project.urls]
+Homepage = "https://github.com/openBLIP25/blip25-mbe-py"
+Repository = "https://github.com/openBLIP25/blip25-mbe-py"
+Upstream = "https://github.com/openBLIP25/blip25-mbe"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "blip25_mbe._blip25_mbe"
+python-source = "python"

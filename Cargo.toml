@@ -1,0 +1,22 @@
+[package]
+name = "blip25-mbe-py"
+version = "0.1.0"
+edition = "2021"
+authors = ["Chance Lindsey"]
+license = "MIT"
+description = "Python bindings for blip25-mbe (P25 MBE/IMBE/AMBE+2 vocoder family)"
+repository = "https://github.com/openBLIP25/blip25-mbe-py"
+publish = false
+
+[lib]
+name = "_blip25_mbe"
+crate-type = ["cdylib"]
+
+[dependencies]
+blip25-mbe = "0.1.0"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy = "0.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
