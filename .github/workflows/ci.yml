@@ -25,9 +25,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: install maturin + test deps
-        run: pip install maturin pytest numpy
-      - name: build + install
-        run: maturin develop --release
+      - name: install + build via PEP 517
+        run: |
+          pip install --upgrade pip
+          pip install pytest numpy
+          pip install .
       - name: pytest
         run: pytest -v

@@ -5,7 +5,8 @@
 //! PCM boundary. Tier-1 surface only; setters, the builder, and
 //! parameter-domain entry points will land in a follow-on.
 
-use blip25_mbe::vocoder::{self as bv, Rate as BRate};
+use blip25_mbe::enhancement::{ClassicalConfig, EnhancementMode};
+use blip25_mbe::vocoder::{self as bv, AmbePlus2Synth as BSynth, AnalysisOutputKind, Rate as BRate};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -51,16 +52,98 @@ impl From<PyRate> for BRate {
 
 impl From<BRate> for PyRate {
     fn from(r: BRate) -> Self {
+        // `Rate` is `#[non_exhaustive]` upstream; the catch-all
+        // covers future variants when this crate is rebuilt against
+        // a newer `blip25-mbe`. Currently unreachable.
+        #[allow(unreachable_patterns)]
         match r {
             BRate::Imbe7200x4400 => PyRate::Imbe7200x4400,
             BRate::Imbe4400x4400 => PyRate::Imbe4400x4400,
             BRate::AmbePlus2_3600x2450 => PyRate::AmbePlus2_3600x2450,
             BRate::AmbePlus2_2450x2450 => PyRate::AmbePlus2_2450x2450,
-            // `Rate` is `#[non_exhaustive]` upstream; if a new variant
-            // appears, rebuild this crate against the newer
-            // `blip25-mbe` to surface it as a `PyRate` variant too.
-            other => panic!("blip25-py: unmapped upstream Rate variant {other:?}"),
+            other => panic!("blip25-mbe-py: unmapped upstream Rate variant {other:?}"),
         }
+    }
+}
+
+/// AMBE+2 unvoiced/voiced synthesis variant. Default is
+/// `AmbePlus` — modern AMBE+ / AMBE+2 sound with US5701390 phase
+/// regen. `Baseline` matches mbelib's half-rate behavior (no
+/// Hilbert phase regen).
+#[pyclass(eq, eq_int, frozen, name = "AmbePlus2Synth")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PyAmbePlus2Synth {
+    #[pyo3(name = "AMBE_PLUS")]
+    AmbePlus,
+    #[pyo3(name = "BASELINE")]
+    Baseline,
+}
+
+impl From<PyAmbePlus2Synth> for BSynth {
+    fn from(s: PyAmbePlus2Synth) -> Self {
+        match s {
+            PyAmbePlus2Synth::AmbePlus => BSynth::AmbePlus,
+            PyAmbePlus2Synth::Baseline => BSynth::Baseline,
+        }
+    }
+}
+
+impl From<BSynth> for PyAmbePlus2Synth {
+    fn from(s: BSynth) -> Self {
+        #[allow(unreachable_patterns)]
+        match s {
+            BSynth::AmbePlus => PyAmbePlus2Synth::AmbePlus,
+            BSynth::Baseline => PyAmbePlus2Synth::Baseline,
+            other => panic!("blip25-mbe-py: unmapped upstream AmbePlus2Synth variant {other:?}"),
+        }
+    }
+}
+
+/// Post-decoder PCM enhancement mode. `NONE` is spec-faithful (no
+/// post-processing); `CLASSICAL` applies the default biquad +
+/// peaking-EQ + output-gain chain (no compressor, fade enabled).
+/// `CLASSICAL` is the upstream library default.
+///
+/// Fine-grained tuning of the classical chain (custom biquads,
+/// compressor knobs, fade samples) isn't exposed from Python yet —
+/// open an issue if you need it.
+#[pyclass(eq, eq_int, frozen, name = "EnhancementMode")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PyEnhancementMode {
+    #[pyo3(name = "NONE")]
+    NoneMode,
+    #[pyo3(name = "CLASSICAL")]
+    Classical,
+}
+
+impl From<PyEnhancementMode> for EnhancementMode {
+    fn from(m: PyEnhancementMode) -> Self {
+        match m {
+            PyEnhancementMode::NoneMode => EnhancementMode::None,
+            PyEnhancementMode::Classical => EnhancementMode::Classical(ClassicalConfig::default()),
+        }
+    }
+}
+
+impl From<&EnhancementMode> for PyEnhancementMode {
+    fn from(m: &EnhancementMode) -> Self {
+        match m {
+            EnhancementMode::None => PyEnhancementMode::NoneMode,
+            EnhancementMode::Classical(_) => PyEnhancementMode::Classical,
+        }
+    }
+}
+
+fn output_kind_str(k: AnalysisOutputKind) -> &'static str {
+    // `AnalysisOutputKind` is `#[non_exhaustive]` upstream; the
+    // catch-all guards against future variants when this crate is
+    // rebuilt against a newer `blip25-mbe`.
+    #[allow(unreachable_patterns)]
+    match k {
+        AnalysisOutputKind::Voice => "voice",
+        AnalysisOutputKind::Silence => "silence",
+        AnalysisOutputKind::Tone { .. } => "tone",
+        _ => "unknown",
     }
 }
 
@@ -123,6 +206,104 @@ impl PyVocoder {
     /// callers sharing one vocoder instance.
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    // ── encoder knobs ───────────────────────────────────────────
+
+    #[getter]
+    fn tone_detection(&self) -> bool { self.inner.tone_detection() }
+
+    fn set_tone_detection(&mut self, on: bool) { self.inner.set_tone_detection(on); }
+
+    #[getter]
+    fn spectral_subtraction(&self) -> bool { self.inner.spectral_subtraction() }
+
+    fn set_spectral_subtraction(&mut self, on: bool) { self.inner.set_spectral_subtraction(on); }
+
+    #[getter]
+    fn silence_dispatch(&self) -> bool { self.inner.silence_dispatch() }
+
+    fn set_silence_dispatch(&mut self, on: bool) { self.inner.set_silence_dispatch(on); }
+
+    #[getter]
+    fn chip_compat(&self) -> bool { self.inner.chip_compat() }
+
+    fn set_chip_compat(&mut self, on: bool) { self.inner.set_chip_compat(on); }
+
+    #[getter]
+    fn chip_compat_spectral_clamp(&self) -> bool { self.inner.chip_compat_spectral_clamp() }
+
+    fn set_chip_compat_spectral_clamp(&mut self, on: bool) {
+        self.inner.set_chip_compat_spectral_clamp(on);
+    }
+
+    #[getter]
+    fn pitch_silence_override(&self) -> bool { self.inner.pitch_silence_override() }
+
+    fn set_pitch_silence_override(&mut self, on: bool) {
+        self.inner.set_pitch_silence_override(on);
+    }
+
+    #[getter]
+    fn default_pitch_on_silence(&self) -> bool { self.inner.default_pitch_on_silence() }
+
+    fn set_default_pitch_on_silence(&mut self, on: bool) {
+        self.inner.set_default_pitch_on_silence(on);
+    }
+
+    #[getter]
+    fn pyin_pitch(&self) -> bool { self.inner.pyin_pitch() }
+
+    fn set_pyin_pitch(&mut self, on: bool) { self.inner.set_pyin_pitch(on); }
+
+    #[getter]
+    fn amp_ema_alpha(&self) -> f64 { self.inner.amp_ema_alpha() }
+
+    fn set_amp_ema_alpha(&mut self, alpha: f64) { self.inner.set_amp_ema_alpha(alpha); }
+
+    #[getter]
+    fn repeat_reset_after(&self) -> Option<u32> { self.inner.repeat_reset_after() }
+
+    #[pyo3(signature = (n=None))]
+    fn set_repeat_reset_after(&mut self, n: Option<u32>) {
+        self.inner.set_repeat_reset_after(n);
+    }
+
+    #[getter]
+    fn ambe_plus2_synth(&self) -> PyAmbePlus2Synth { self.inner.ambe_plus2_synth().into() }
+
+    fn set_ambe_plus2_synth(&mut self, gen: PyAmbePlus2Synth) {
+        self.inner.set_ambe_plus2_synth(gen.into());
+    }
+
+    #[getter]
+    fn enhancement(&self) -> PyEnhancementMode { self.inner.enhancement().into() }
+
+    fn set_enhancement(&mut self, mode: PyEnhancementMode) {
+        self.inner.set_enhancement(mode.into());
+    }
+
+    // ── diagnostics ────────────────────────────────────────────
+
+    /// `"voice"` / `"silence"` / `"tone"` for the last encoded frame,
+    /// or `None` if no encode has run since the last [`reset`].
+    fn last_output_kind(&self) -> Option<&'static str> {
+        self.inner
+            .last_stats()
+            .analysis
+            .as_ref()
+            .map(|a| output_kind_str(a.output))
+    }
+
+    /// `(id, amplitude)` for the last frame's Annex T tone detection,
+    /// or `None` if tone detection is disabled or no tone was found.
+    fn last_tone_detection(&self) -> Option<(u8, u8)> {
+        self.inner
+            .last_stats()
+            .analysis
+            .as_ref()
+            .and_then(|a| a.tone_detect)
+            .map(|t| (t.id, t.amplitude))
     }
 
     fn __repr__(&self) -> String {
@@ -274,6 +455,8 @@ impl PyTranscoder {
 #[pymodule]
 fn _blip25_mbe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRate>()?;
+    m.add_class::<PyAmbePlus2Synth>()?;
+    m.add_class::<PyEnhancementMode>()?;
     m.add_class::<PyVocoder>()?;
     m.add_class::<PyLiveEncoder>()?;
     m.add_class::<PyLiveDecoder>()?;
