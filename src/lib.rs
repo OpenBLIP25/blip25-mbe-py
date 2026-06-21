@@ -43,7 +43,11 @@ pub enum PyRate {
     /// P25 Phase 2 TDMA AMBE+2 (9-byte FEC frame, 3 600 bps).
     #[pyo3(name = "AMBEPLUS2_3600X2450")]
     AmbePlus2_3600x2450,
-    /// AMBE+2 info-only (7-byte frame, 2 450 bps).
+    /// AMBE+2 info-only (7-byte frame, 2 450 bps). The 49 info bits are
+    /// packed in DVSI **r34 column-interleave** order — byte-exact with
+    /// DVSI's chip rate-index 34 no-FEC stream, *not* naive MSB-first
+    /// sequential. Consumers needing natural / "AMBE_d" order (mbelib,
+    /// IDAS/NXDN over-the-air) must de-interleave first.
     #[pyo3(name = "AMBEPLUS2_2450X2450")]
     AmbePlus2_2450x2450,
 }

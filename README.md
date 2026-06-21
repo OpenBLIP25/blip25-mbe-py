@@ -54,6 +54,12 @@ out_bits = tc.transcode(in_bits)
 | `Rate.AMBEPLUS2_3600X2450`        | AMBE+2      |  9 bytes  | 3 600 bps   |
 | `Rate.AMBEPLUS2_2450X2450`        | AMBE+2 no-FEC | 7 bytes | 2 450 bps   |
 
+> **`AMBEPLUS2_2450X2450` byte order.** The 7-byte no-FEC frame packs the
+> 49 info bits in DVSI **r34 column-interleave** order (byte-exact with
+> DVSI's chip rate-index 34 no-FEC stream), *not* naive MSB-first
+> sequential. Consumers expecting natural / "AMBE_d" order (mbelib,
+> IDAS/NXDN over-the-air) must de-interleave first.
+
 ## Encoder tuning (blip25-mbe 0.2.0)
 
 `Vocoder` exposes the upstream encode-quality and denoiser levers. The

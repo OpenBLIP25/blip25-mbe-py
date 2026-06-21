@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "blip25-mbe"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python bindings for blip25-mbe — P25 MBE/IMBE/AMBE+2 vocoder family"
 readme = "README.md"
 license = { text = "MIT" }
