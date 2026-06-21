@@ -112,6 +112,40 @@ wire = dsd.packet_to_bytes(packet)                  # 120 big-endian bytes
 > chip `-r` rate-control vectors — a *different* framing from the
 > packet's 5-word `rate_info` field; don't cross-assign them.
 
+## Half-rate channel frame (`rate33`)
+
+`blip25_mbe.rate33` exposes the half-rate (DVSI rate-33) AMBE+2 **channel
+frame** layer that sits below the PCM↔wire façade — the four info
+vectors `û₀..û₃`, the FEC code vectors `c₀..c₃`, and the deprioritized
+`b̂₀..b̂₈` voice-parameter fields. Use it to pull parameter fields out of
+captured frames or to drive the FEC core directly (the reuse point for
+other half-rate AMBE+2 protocols: DMR, NXDN, P25 Phase 2).
+
+The one-call field extractors cover all three on-wire forms:
+
+```python
+from blip25_mbe import rate33
+
+b = rate33.fields_from_fec(frame9)       # 9-byte FEC (Rate.AMBEPLUS2_3600X2450)
+b = rate33.fields_from_no_fec(frame7)    # 7-byte DVSI r34 no-FEC (AMBEPLUS2_2450X2450)
+b = rate33.fields_from_natural(frame7)   # 7-byte natural / AMBE_d (mbelib, IDAS/NXDN OTA)
+# each returns the 9 deprioritized fields b̂₀..b̂₈ (widths AMBE_PARAM_WIDTHS)
+```
+
+Lower-level primitives are also exposed: `unpack_no_fec` / `pack_no_fec`
+and `natural_to_info` / `info_to_natural` (the two 7-byte byte orders),
+`deinterleave` / `interleave` and `decode_frame` / `encode_frame`
+(Annex-S + Golay/PN FEC core, with a soft-decision `decode_frame_soft`),
+`prioritize` / `deprioritize`, and `unpack_dibits` / `pack_dibits`.
+`decode_frame` returns a `Rate33Frame` with `.info`, `.errors`, and
+`.error_total()`.
+
+> **r34 vs natural order.** The 7-byte no-FEC frame has two incompatible
+> layouts. `Rate.AMBEPLUS2_2450X2450` and `*_no_fec` use the DVSI **r34
+> column interleave**; mbelib and IDAS/NXDN over-the-air use **natural /
+> AMBE_d** sequential order. Pick the matching `fields_from_*` /
+> `*_to_info` function — they are not interchangeable.
+
 ## Building from source
 
 ```bash

@@ -8,6 +8,7 @@
 use blip25_mbe::codecs::mbe_baseline::analysis::DenoiseKind as BDenoiseKind;
 use blip25_mbe::dvsi_soft_decision as sd;
 use blip25_mbe::enhancement::{ClassicalConfig, EnhancementMode};
+use blip25_mbe::rate33::{frame as r33f, priority as r33p};
 use blip25_mbe::vocoder::{self as bv, AmbePlus2Synth as BSynth, AnalysisOutputKind, Rate as BRate};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
@@ -768,6 +769,349 @@ fn register_dvsi_sd(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// ── rate33 half-rate channel-frame toolkit (blip25-mbe 0.2.2) ───────
+// Thin wrappers over `blip25_mbe::rate33::{frame, priority}` — the
+// half-rate AMBE+2 *channel frame* layer that sits below the PCM↔wire
+// façade. Lets callers work with the four info vectors `û₀..û₃`, the
+// FEC code vectors `c₀..c₃`, the deprioritized `b̂₀..b̂₈` voice-parameter
+// fields, and the r34 / natural (AMBE_d) no-FEC byte orders directly.
+// Exposed as the `blip25_mbe.rate33` submodule.
+
+/// Require an exact byte length, else a `ValueError` naming the caller.
+fn require_len(bytes: &[u8], n: usize, what: &str) -> PyResult<()> {
+    if bytes.len() != n {
+        return Err(PyValueError::new_err(format!(
+            "{what}: expected {n} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// û₀ is a 12-bit info word — reject out-of-range seeds rather than
+/// silently producing a garbage PN sequence (upstream only
+/// `debug_assert`s this, which is a no-op in release builds).
+fn check_u0(u0: u16) -> PyResult<()> {
+    if u0 >= 4096 {
+        return Err(PyValueError::new_err(format!(
+            "û₀ must be a 12-bit value (0..=4095), got {u0}"
+        )));
+    }
+    Ok(())
+}
+
+/// Unpack a packed MSB-first byte frame into 2-bit dibit values
+/// (4 per byte). Used for the 9-byte FEC frame → 36 dibits handoff.
+fn bytes_to_dibits(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() * 4);
+    for &byte in bytes {
+        out.push((byte >> 6) & 0b11);
+        out.push((byte >> 4) & 0b11);
+        out.push((byte >> 2) & 0b11);
+        out.push(byte & 0b11);
+    }
+    out
+}
+
+/// Recover `û₀..û₃` from a 7-byte natural / AMBE_d (plain sequential
+/// MSB-first) no-FEC frame. Distinct from the r34 column interleave.
+fn natural_to_info_arr(bytes: &[u8]) -> [u16; 4] {
+    let mut natural = [0u8; r33f::INFO_BITS_TOTAL as usize];
+    for (i, slot) in natural.iter_mut().enumerate() {
+        *slot = (bytes[i / 8] >> (7 - (i % 8))) & 1;
+    }
+    let mut info = [0u16; 4];
+    let mut idx = 0usize;
+    for (oi, &w) in r33f::INFO_WIDTHS.iter().enumerate() {
+        let mut v = 0u16;
+        for _ in 0..w {
+            v = (v << 1) | u16::from(natural[idx]);
+            idx += 1;
+        }
+        info[oi] = v;
+    }
+    info
+}
+
+/// Inverse of [`natural_to_info_arr`]: pack `û₀..û₃` into 7 natural
+/// (AMBE_d, plain sequential) bytes. Bits 49..55 are zero pad.
+fn info_to_natural_arr(info: &[u16; 4]) -> [u8; 7] {
+    let mut out = [0u8; 7];
+    let mut idx = 0usize;
+    for (&w, &v) in r33f::INFO_WIDTHS.iter().zip(info.iter()) {
+        for k in (0..w as usize).rev() {
+            let bit = ((v >> k) & 1) as u8;
+            out[idx / 8] |= bit << (7 - (idx % 8));
+            idx += 1;
+        }
+    }
+    out
+}
+
+/// Decoded 49-bit information layer of a half-rate (rate-33) frame: the
+/// four info vectors `û₀..û₃` (LSB-aligned, widths per `INFO_WIDTHS`)
+/// plus the per-vector FEC error counts.
+#[pyclass(name = "Rate33Frame", frozen)]
+#[derive(Clone)]
+pub struct PyRate33Frame {
+    inner: r33f::Frame,
+}
+
+#[pymethods]
+impl PyRate33Frame {
+    /// The four info vectors `û₀..û₃`.
+    #[getter]
+    fn info(&self) -> Vec<u16> {
+        self.inner.info.to_vec()
+    }
+
+    /// Per-vector FEC error counts. `errors[0]` is 0–3 (or 255 for an
+    /// uncorrectable extended-Golay `c₀`); `errors[1]` is 0–3; the
+    /// uncoded `errors[2]`/`errors[3]` are always 0.
+    #[getter]
+    fn errors(&self) -> Vec<u8> {
+        self.inner.errors.to_vec()
+    }
+
+    /// Total error count across all four vectors.
+    fn error_total(&self) -> u16 {
+        self.inner.error_total()
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Rate33Frame(info={:?}, errors={:?})", self.inner.info, self.inner.errors)
+    }
+}
+
+// ── frame: no-FEC byte orders ───────────────────────────────────────
+
+/// Pack the four info vectors `û₀..û₃` into a 7-byte DVSI **r34**
+/// no-FEC frame (the `Rate.AMBEPLUS2_2450X2450` wire form), applying the
+/// r34 3-way column interleave. Bits 49..55 are zero pad.
+#[pyfunction]
+fn pack_no_fec<'py>(py: Python<'py>, info: [u16; 4]) -> Bound<'py, PyBytes> {
+    PyBytes::new_bound(py, &r33f::pack_no_fec(&info))
+}
+
+/// Inverse of [`pack_no_fec`]: recover `û₀..û₃` from a 7-byte r34
+/// no-FEC frame (de-interleaves the r34 column order).
+#[pyfunction]
+fn unpack_no_fec(bytes: &[u8]) -> PyResult<Vec<u16>> {
+    require_len(bytes, 7, "unpack_no_fec")?;
+    Ok(r33f::unpack_no_fec(bytes).to_vec())
+}
+
+/// Recover `û₀..û₃` from a 7-byte **natural / AMBE_d** (plain
+/// sequential MSB-first) no-FEC frame — the mbelib / IDAS / NXDN
+/// over-the-air order, NOT the r34 column interleave.
+#[pyfunction]
+fn natural_to_info(bytes: &[u8]) -> PyResult<Vec<u16>> {
+    require_len(bytes, 7, "natural_to_info")?;
+    Ok(natural_to_info_arr(bytes).to_vec())
+}
+
+/// Inverse of [`natural_to_info`]: pack `û₀..û₃` into a 7-byte natural
+/// (AMBE_d, plain sequential) no-FEC frame.
+#[pyfunction]
+fn info_to_natural<'py>(py: Python<'py>, info: [u16; 4]) -> Bound<'py, PyBytes> {
+    PyBytes::new_bound(py, &info_to_natural_arr(&info))
+}
+
+// ── frame: FEC core (Annex-S interleave + Golay/PN) ─────────────────
+
+/// Annex-S deinterleave 36 dibits → the 4 code vectors `c₀..c₃`.
+#[pyfunction]
+fn deinterleave(dibits: [u8; r33f::DIBITS_PER_FRAME]) -> Vec<u32> {
+    r33f::deinterleave(&dibits).to_vec()
+}
+
+/// Annex-S interleave 4 code vectors `c₀..c₃` → 36 dibits. Inverse of
+/// [`deinterleave`].
+#[pyfunction]
+fn interleave(codewords: [u32; 4]) -> Vec<u8> {
+    r33f::interleave(&codewords).to_vec()
+}
+
+/// The half-rate PN sequence `p_r(0..=23)` seeded from `û₀`.
+#[pyfunction]
+fn pn_sequence(u0: u16) -> PyResult<Vec<u16>> {
+    check_u0(u0)?;
+    Ok(r33f::pn_sequence(u0).to_vec())
+}
+
+/// The 4 PN modulation masks `m̂₀..m̂₃` derived from `û₀`.
+#[pyfunction]
+fn modulation_masks(u0: u16) -> PyResult<Vec<u32>> {
+    check_u0(u0)?;
+    Ok(r33f::modulation_masks(u0).to_vec())
+}
+
+/// Demodulate the 4 code vectors against the `û₀`-seeded PN masks,
+/// recovering `v̂₀..v̂₃`.
+#[pyfunction]
+fn demodulate(codewords: [u32; 4], u0: u16) -> PyResult<Vec<u32>> {
+    check_u0(u0)?;
+    Ok(r33f::demodulate(codewords, u0).to_vec())
+}
+
+/// Decode the 4 code vectors `c̃₀..c̃₃` (no interleave) through the
+/// Golay/PN FEC core → [`Rate33Frame`]. The protocol-agnostic reuse
+/// boundary for any half-rate AMBE+2 protocol (P25 Phase 2, DMR, NXDN).
+#[pyfunction]
+fn decode_code_vectors(codewords: [u32; 4]) -> PyRate33Frame {
+    PyRate33Frame { inner: r33f::decode_code_vectors(codewords) }
+}
+
+/// Decode a half-rate frame from 36 P25-Phase-2 dibits → [`Rate33Frame`]
+/// (Annex-S deinterleave + the Golay/PN FEC core).
+#[pyfunction]
+fn decode_frame(dibits: [u8; r33f::DIBITS_PER_FRAME]) -> PyRate33Frame {
+    PyRate33Frame { inner: r33f::decode_frame(&dibits) }
+}
+
+/// Soft-decision decode a half-rate frame from 72 P25-Phase-2 soft bits
+/// (`int8` LLRs: sign = hard bit, magnitude = confidence; layout
+/// `[hi_dibit0, lo_dibit0, …]`) → [`Rate33Frame`].
+#[pyfunction]
+fn decode_frame_soft(soft: PyReadonlyArray1<'_, i8>) -> PyResult<PyRate33Frame> {
+    let slice = soft.as_slice()?;
+    let arr: &[i8; r33f::SOFT_BITS] = slice.try_into().map_err(|_| {
+        PyValueError::new_err(format!(
+            "decode_frame_soft: expected {} soft bits, got {}",
+            r33f::SOFT_BITS,
+            slice.len()
+        ))
+    })?;
+    Ok(PyRate33Frame { inner: r33f::decode_frame_soft(arr) })
+}
+
+/// Encode 4 info vectors `û₀..û₃` into 72 air-interface bits (36
+/// dibits). Inverse of [`decode_frame`].
+#[pyfunction]
+fn encode_frame(info: [u16; 4]) -> Vec<u8> {
+    r33f::encode_frame(&info).to_vec()
+}
+
+// ── priority: info vectors ↔ b̂₀..b̂₈ voice-parameter fields ─────────
+
+/// Prioritize the 9 quantized half-rate parameters `b̂₀..b̂₈` into the
+/// 4 info vectors `û₀..û₃` (BABA-A §16.7).
+#[pyfunction]
+fn prioritize(b: [u16; r33p::AMBE_B_COUNT]) -> Vec<u16> {
+    r33p::prioritize(&b).to_vec()
+}
+
+/// Deprioritize the 4 info vectors `û₀..û₃` into the 9 quantized
+/// parameters `b̂₀..b̂₈`. Inverse of [`prioritize`].
+#[pyfunction]
+fn deprioritize(u: [u16; 4]) -> Vec<u16> {
+    r33p::deprioritize(&u).to_vec()
+}
+
+// ── byte ↔ dibit helpers ────────────────────────────────────────────
+
+/// Unpack a packed MSB-first byte string into 2-bit dibit values
+/// (4 per byte). 9 FEC bytes → 36 dibits for [`decode_frame`].
+#[pyfunction]
+fn unpack_dibits(bytes: &[u8]) -> Vec<u8> {
+    bytes_to_dibits(bytes)
+}
+
+/// Pack 2-bit dibit values back into MSB-first bytes (4 per byte).
+/// Inverse of [`unpack_dibits`]; the dibit count must be a multiple of 4.
+#[pyfunction]
+fn pack_dibits<'py>(py: Python<'py>, dibits: Vec<u8>) -> PyResult<Bound<'py, PyBytes>> {
+    if dibits.len() % 4 != 0 {
+        return Err(PyValueError::new_err(format!(
+            "pack_dibits: dibit count must be a multiple of 4, got {}",
+            dibits.len()
+        )));
+    }
+    let mut out = vec![0u8; dibits.len() / 4];
+    for (i, &d) in dibits.iter().enumerate() {
+        out[i / 4] |= (d & 0b11) << (6 - 2 * (i % 4));
+    }
+    Ok(PyBytes::new_bound(py, &out))
+}
+
+// ── field-dump conveniences (the whole pipeline in one call) ────────
+
+/// Deprioritized `b̂₀..b̂₈` fields from a 9-byte FEC frame (the
+/// `Rate.AMBEPLUS2_3600X2450` wire form): byte→dibit, Annex-S
+/// deinterleave + Golay/PN FEC decode, then deprioritize.
+#[pyfunction]
+fn fields_from_fec(bytes: &[u8]) -> PyResult<Vec<u16>> {
+    require_len(bytes, 9, "fields_from_fec")?;
+    let dibits: [u8; r33f::DIBITS_PER_FRAME] = bytes_to_dibits(bytes)
+        .try_into()
+        .expect("9 bytes is exactly 36 dibits");
+    Ok(r33p::deprioritize(&r33f::decode_frame(&dibits).info).to_vec())
+}
+
+/// Deprioritized `b̂₀..b̂₈` fields from a 7-byte DVSI **r34** no-FEC
+/// frame (the `Rate.AMBEPLUS2_2450X2450` wire form).
+#[pyfunction]
+fn fields_from_no_fec(bytes: &[u8]) -> PyResult<Vec<u16>> {
+    require_len(bytes, 7, "fields_from_no_fec")?;
+    Ok(r33p::deprioritize(&r33f::unpack_no_fec(bytes)).to_vec())
+}
+
+/// Deprioritized `b̂₀..b̂₈` fields from a 7-byte **natural / AMBE_d**
+/// (plain sequential) no-FEC frame — the mbelib / IDAS / NXDN order.
+#[pyfunction]
+fn fields_from_natural(bytes: &[u8]) -> PyResult<Vec<u16>> {
+    require_len(bytes, 7, "fields_from_natural")?;
+    Ok(r33p::deprioritize(&natural_to_info_arr(bytes)).to_vec())
+}
+
+/// Build and register the `rate33` submodule.
+fn register_rate33(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = parent.py();
+    let m = PyModule::new_bound(py, "rate33")?;
+    m.add_class::<PyRate33Frame>()?;
+    m.add_function(wrap_pyfunction!(pack_no_fec, &m)?)?;
+    m.add_function(wrap_pyfunction!(unpack_no_fec, &m)?)?;
+    m.add_function(wrap_pyfunction!(natural_to_info, &m)?)?;
+    m.add_function(wrap_pyfunction!(info_to_natural, &m)?)?;
+    m.add_function(wrap_pyfunction!(deinterleave, &m)?)?;
+    m.add_function(wrap_pyfunction!(interleave, &m)?)?;
+    m.add_function(wrap_pyfunction!(pn_sequence, &m)?)?;
+    m.add_function(wrap_pyfunction!(modulation_masks, &m)?)?;
+    m.add_function(wrap_pyfunction!(demodulate, &m)?)?;
+    m.add_function(wrap_pyfunction!(decode_code_vectors, &m)?)?;
+    m.add_function(wrap_pyfunction!(decode_frame, &m)?)?;
+    m.add_function(wrap_pyfunction!(decode_frame_soft, &m)?)?;
+    m.add_function(wrap_pyfunction!(encode_frame, &m)?)?;
+    m.add_function(wrap_pyfunction!(prioritize, &m)?)?;
+    m.add_function(wrap_pyfunction!(deprioritize, &m)?)?;
+    m.add_function(wrap_pyfunction!(unpack_dibits, &m)?)?;
+    m.add_function(wrap_pyfunction!(pack_dibits, &m)?)?;
+    m.add_function(wrap_pyfunction!(fields_from_fec, &m)?)?;
+    m.add_function(wrap_pyfunction!(fields_from_no_fec, &m)?)?;
+    m.add_function(wrap_pyfunction!(fields_from_natural, &m)?)?;
+    m.add("INFO_WIDTHS", r33f::INFO_WIDTHS.to_vec())?;
+    m.add("CODE_WIDTHS", r33f::CODE_WIDTHS.to_vec())?;
+    m.add("INFO_BITS_TOTAL", r33f::INFO_BITS_TOTAL)?;
+    m.add("R34_BIT_ORDER", r33f::R34_BIT_ORDER.to_vec())?;
+    m.add("PN_SEQ_LEN", r33f::PN_SEQ_LEN)?;
+    m.add("DIBITS_PER_FRAME", r33f::DIBITS_PER_FRAME)?;
+    m.add("SOFT_BITS", r33f::SOFT_BITS)?;
+    m.add("AMBE_B_COUNT", r33p::AMBE_B_COUNT)?;
+    m.add("AMBE_PARAM_WIDTHS", r33p::AMBE_PARAM_WIDTHS.to_vec())?;
+    m.add("AMBE_VECTOR_WIDTHS", r33p::AMBE_VECTOR_WIDTHS.to_vec())?;
+    parent.add_submodule(&m)?;
+    // Register in sys.modules so `import blip25_mbe._blip25_mbe.rate33`
+    // resolves (pyo3 submodules are not auto-registered).
+    py.import_bound("sys")?
+        .getattr("modules")?
+        .set_item("blip25_mbe._blip25_mbe.rate33", &m)?;
+    Ok(())
+}
+
 #[pymodule]
 fn _blip25_mbe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRate>()?;
@@ -779,6 +1123,7 @@ fn _blip25_mbe(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLiveDecoder>()?;
     m.add_class::<PyTranscoder>()?;
     register_dvsi_sd(m)?;
+    register_rate33(m)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

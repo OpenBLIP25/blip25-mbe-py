@@ -4,6 +4,7 @@ Top-level re-exports of the compiled extension symbols.
 """
 
 from . import dvsi_soft_decision
+from . import rate33
 from ._blip25_mbe import (
     __version__,
     AmbePlus2Synth,
@@ -27,4 +28,5 @@ __all__ = [
     "Transcoder",
     "Vocoder",
     "dvsi_soft_decision",
+    "rate33",
 ]
