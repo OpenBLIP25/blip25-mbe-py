@@ -3,9 +3,11 @@
 Top-level re-exports of the compiled extension symbols.
 """
 
+from . import dvsi_soft_decision
 from ._blip25_mbe import (
     __version__,
     AmbePlus2Synth,
+    DenoiseKind,
     EnhancementMode,
     LiveDecoder,
     LiveEncoder,
@@ -17,10 +19,12 @@ from ._blip25_mbe import (
 __all__ = [
     "__version__",
     "AmbePlus2Synth",
+    "DenoiseKind",
     "EnhancementMode",
     "LiveDecoder",
     "LiveEncoder",
     "Rate",
     "Transcoder",
     "Vocoder",
+    "dvsi_soft_decision",
 ]

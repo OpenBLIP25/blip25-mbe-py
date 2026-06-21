@@ -8,10 +8,11 @@ import blip25_mbe
 
 def test_default_setters_match_library_defaults() -> None:
     vc = blip25_mbe.Vocoder(blip25_mbe.Rate.IMBE_7200X4400)
-    # `Vocoder::new` enables enhancement (Classical) and spectral
-    # subtraction by default; everything else defaults off.
+    # `Vocoder::new` enables the post-decode Classical enhancement chain
+    # by default; everything else (incl. spectral subtraction, opt-in
+    # since blip25-mbe 0.2.0) defaults off.
     assert vc.enhancement == blip25_mbe.EnhancementMode.CLASSICAL
-    assert vc.spectral_subtraction is True
+    assert vc.spectral_subtraction is False
     assert vc.tone_detection is False
     assert vc.silence_dispatch is False
     assert vc.chip_compat is False
@@ -42,6 +43,56 @@ def test_setters_round_trip() -> None:
 
     vc.set_ambe_plus2_synth(blip25_mbe.AmbePlus2Synth.BASELINE)
     assert vc.ambe_plus2_synth == blip25_mbe.AmbePlus2Synth.BASELINE
+
+
+def test_encode_quality_stack_defaults_and_setters() -> None:
+    # The 0.2.0 AMBE+2 production encode-quality stack: escape /
+    # subsample / M(ξ) grade default ON; §0.4 refine bypassed (OFF).
+    vc = blip25_mbe.Vocoder(blip25_mbe.Rate.AMBEPLUS2_3600X2450)
+    assert vc.pitch_decide_escape is True
+    assert vc.pitch_subsample is True
+    assert vc.pitch_refine is False
+    assert vc.vuv_mxi_grade is True
+
+    vc.set_pitch_decide_escape(False)
+    assert vc.pitch_decide_escape is False
+    vc.set_pitch_subsample(False)
+    assert vc.pitch_subsample is False
+    vc.set_pitch_refine(True)
+    assert vc.pitch_refine is True
+    vc.set_vuv_mxi_grade(False)
+    assert vc.vuv_mxi_grade is False
+
+    # Write-only levers (no upstream getter) — must not raise.
+    vc.set_vuv_pitch_coef(0.0)
+    vc.set_amp_frac_band_edges(True)
+    vc.set_level_scale(True)
+    vc.set_silence_shape_zero(True)
+
+
+def test_denoiser_front_ends_opt_in() -> None:
+    vc = blip25_mbe.Vocoder(blip25_mbe.Rate.AMBEPLUS2_3600X2450)
+    # Both front-ends default OFF.
+    assert vc.denoise is False
+    assert vc.hum_notch is False
+
+    vc.set_denoise(True)
+    assert vc.denoise is True
+    vc.set_denoise(False)
+    assert vc.denoise is False
+
+    for kind in (
+        blip25_mbe.DenoiseKind.LOG_MMSE,
+        blip25_mbe.DenoiseKind.WIENER,
+        blip25_mbe.DenoiseKind.SPEC_SUB,
+    ):
+        vc.set_denoise_kind(kind)
+        assert vc.denoise is True
+
+    vc.set_hum_notch(True)
+    assert vc.hum_notch is True
+    vc.set_hum_notch_mains(50.0)  # EU mains; stays enabled
+    assert vc.hum_notch is True
 
 
 def test_last_output_kind_after_encode() -> None:
